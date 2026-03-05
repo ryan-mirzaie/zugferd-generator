@@ -706,7 +706,8 @@ with tab1:
     buyer_zip    = c2.text_input("PLZ",     value="")
     buyer_city   = c3.text_input("Ort",     value="")
     c1, c2, c3 = st.columns(3)
-    buyer_vat    = c1.text_input("USt-IdNr. Käufer", value="", placeholder="DE123456789")
+    buyer_vat     = c1.text_input("USt-IdNr. Käufer", value="", placeholder="DE123456789")
+    buyer_country = c2.text_input("Land Käufer", value="DE", placeholder="DE")
 
     st.subheader("Abweichende Lieferadresse")
     use_shipto = st.checkbox("Abweichende Lieferadresse / Warenempfänger angeben")
@@ -716,12 +717,15 @@ with tab1:
         shipto_gln    = c2.text_input("GLN Warenempfänger", placeholder="13-stellig")
         shipto_dept   = c3.text_input("Abteilung / ILN-Filiale")
         c1, c2, c3 = st.columns(3)
-        shipto_street = c1.text_input("Straße (Lieferort)")
-        shipto_zip    = c2.text_input("PLZ (Lieferort)")
-        shipto_city   = c3.text_input("Ort (Lieferort)")
+        shipto_street   = c1.text_input("Straße (Lieferort)")
+        shipto_zip      = c2.text_input("PLZ (Lieferort)")
+        shipto_city     = c3.text_input("Ort (Lieferort)")
+        c1, c2, c3 = st.columns(3)
+        shipto_country  = c1.text_input("Land (Lieferort)", value="DE", placeholder="DE")
     else:
         shipto_name = buyer_name; shipto_gln = buyer_gln; shipto_dept = ""
         shipto_street = buyer_street; shipto_zip = buyer_zip; shipto_city = buyer_city
+        shipto_country = buyer_country
 
     st.subheader("Belegkopf")
     c1, c2, c3, c4 = st.columns(4)
@@ -880,7 +884,7 @@ with tab3:
                         "street":  buyer_street.strip(),
                         "zip":     buyer_zip.strip(),
                         "city":    buyer_city.strip(),
-                        "country": "DE",
+                        "country": buyer_country.strip() or "DE",
                         "vat_id":  buyer_vat.strip(),
                     },
                     "shipto": {
@@ -890,7 +894,7 @@ with tab3:
                         "street":  shipto_street,
                         "zip":     shipto_zip,
                         "city":    shipto_city,
-                        "country": "DE",
+                        "country": shipto_country.strip() or "DE",
                     },
                     "positions":           [dict(p) for p in st.session_state.positions],
                     "header_discount_pct": header_disc_pct,
