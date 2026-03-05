@@ -19,6 +19,26 @@ from reportlab.platypus import (
 )
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_RIGHT
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+# ─── Font registration (embedded TTF for PDF/A-3 compliance) ─────────────────
+_FONT_REGULAR = "Helvetica"
+_FONT_BOLD    = "Helvetica-Bold"
+
+def _register_fonts():
+    global _FONT_REGULAR, _FONT_BOLD
+    import reportlab as _rl
+    rl_fonts = os.path.join(os.path.dirname(_rl.__file__), "fonts")
+    vera     = os.path.join(rl_fonts, "Vera.ttf")
+    vera_bd  = os.path.join(rl_fonts, "VeraBd.ttf")
+    if os.path.exists(vera) and os.path.exists(vera_bd):
+        pdfmetrics.registerFont(TTFont("VeraSans",      vera))
+        pdfmetrics.registerFont(TTFont("VeraSans-Bold", vera_bd))
+        _FONT_REGULAR = "VeraSans"
+        _FONT_BOLD    = "VeraSans-Bold"
+
+_register_fonts()
 
 # ─── Page setup ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -96,7 +116,9 @@ def calculate_totals(positions, header_discount_pct, shipping_charge_eur, shippi
 
     for pos in positions:
         rate      = Decimal(str(pos["vat_rate"]))
-        net_price = d4(pos["gross_price"]) * (1 - Decimal(str(pos["discount_pct"])) / 100)
+        gross_d4  = d4(pos["gross_price"])
+        disc_amt  = d4(gross_d4 * Decimal(str(pos["discount_pct"])) / 100) if pos["discount_pct"] > 0 else Decimal("0")
+        net_price = gross_d4 - disc_amt
         line_tot  = d2(net_price * Decimal(str(pos["qty"])))
         vat_groups[rate] = vat_groups.get(rate, Decimal("0")) + line_tot
 
@@ -221,16 +243,18 @@ def build_xml(data: dict) -> bytes:
 
         agree = etree.SubElement(line, ram("SpecifiedLineTradeAgreement"))
         gross = etree.SubElement(agree, ram("GrossPriceProductTradePrice"))
-        etree.SubElement(gross, ram("ChargeAmount")).text = fmt_price(d4(pos["gross_price"]))
+        gross_d4 = d4(pos["gross_price"])
+        etree.SubElement(gross, ram("ChargeAmount")).text = fmt_price(gross_d4)
+        disc_amount = Decimal("0")
         if pos.get("discount_pct", 0) > 0:
             disc_alloc = etree.SubElement(gross, ram("AppliedTradeAllowanceCharge"))
             ci = etree.SubElement(disc_alloc, ram("ChargeIndicator"))
             etree.SubElement(ci, udt("Indicator")).text = "false"
-            disc_amount = d4(d4(pos["gross_price"]) * Decimal(str(pos["discount_pct"])) / 100)
+            disc_amount = d4(gross_d4 * Decimal(str(pos["discount_pct"])) / 100)
             etree.SubElement(disc_alloc, ram("ActualAmount")).text = fmt_price(disc_amount)
             etree.SubElement(disc_alloc, ram("Reason")).text = "Artikelrabatt"
 
-        net_price = d4(pos["gross_price"]) * (1 - Decimal(str(pos.get("discount_pct", 0))) / 100)
+        net_price = gross_d4 - disc_amount
         net_elem  = etree.SubElement(agree, ram("NetPriceProductTradePrice"))
         etree.SubElement(net_elem, ram("ChargeAmount")).text = fmt_price(net_price)
 
@@ -380,6 +404,60 @@ def build_xml(data: dict) -> bytes:
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", pretty_print=True)
 
 
+# ─── sRGB OutputIntent post-processor (PDF/A-3 DeviceRGB compliance) ─────────
+def _add_srgb_output_intent(pdf_bytes: bytes) -> bytes:
+    """Post-process PDF to add sRGB OutputIntent for PDF/A-3 DeviceRGB compliance."""
+    icc_paths = [
+        "/System/Library/ColorSync/Profiles/sRGB Profile.icc",
+        "/Library/ColorSync/Profiles/sRGB Profile.icc",
+        "/usr/share/color/icc/sRGB.icc",
+        "/usr/share/color/icc/colord/sRGB.icc",
+    ]
+    icc_data = None
+    for p in icc_paths:
+        if os.path.exists(p):
+            with open(p, "rb") as f:
+                icc_data = f.read()
+            break
+    if not icc_data:
+        return pdf_bytes  # No ICC profile found, skip
+
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import (
+        DictionaryObject, ArrayObject, NameObject,
+        DecodedStreamObject, NumberObject, ByteStringObject
+    )
+
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    writer = PdfWriter(clone_from=reader)
+
+    # Create ICC profile stream
+    icc_obj = DecodedStreamObject()
+    icc_obj._data = icc_data
+    icc_obj[NameObject("/N")] = NumberObject(3)  # RGB = 3 channels
+    icc_obj[NameObject("/Alternate")] = NameObject("/DeviceRGB")
+    icc_ref = writer._add_object(icc_obj)
+
+    # Create OutputIntent dictionary
+    oi = DictionaryObject()
+    oi[NameObject("/Type")] = NameObject("/OutputIntent")
+    oi[NameObject("/S")] = NameObject("/GTS_PDFA1")
+    oi[NameObject("/OutputConditionIdentifier")] = ByteStringObject(b"sRGB IEC61966-2-1")
+    oi[NameObject("/Info")] = ByteStringObject(b"sRGB IEC61966-2-1")
+    oi[NameObject("/DestOutputProfile")] = icc_ref
+    oi_ref = writer._add_object(oi)
+
+    # Add OutputIntents to the catalog
+    root = writer._root_object
+    if NameObject("/OutputIntents") not in root:
+        root[NameObject("/OutputIntents")] = ArrayObject()
+    root[NameObject("/OutputIntents")].append(oi_ref)
+
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
 # ─── PDF Builder ──────────────────────────────────────────────────────────────
 SHEKO_BLUE  = colors.HexColor("#003D8F")
 LIGHT_GRAY  = colors.HexColor("#F5F5F5")
@@ -396,19 +474,19 @@ def build_pdf(data: dict) -> bytes:
 
     styles = getSampleStyleSheet()
     normal = styles["Normal"]
-    normal.fontName = "Helvetica"
+    normal.fontName = _FONT_REGULAR
     normal.fontSize = 9
 
     def style(name, **kw):
         s = ParagraphStyle(name, parent=normal, **kw)
         return s
 
-    bold9   = style("bold9",   fontName="Helvetica-Bold",  fontSize=9)
+    bold9   = style("bold9",   fontName=_FONT_BOLD,  fontSize=9)
     small8  = style("small8",  fontSize=8,  textColor=DARK_GRAY)
     right9  = style("right9",  alignment=TA_RIGHT, fontSize=9)
-    bold_r  = style("bold_r",  fontName="Helvetica-Bold", alignment=TA_RIGHT, fontSize=9)
-    title_s = style("title_s", fontName="Helvetica-Bold", fontSize=15, textColor=SHEKO_BLUE)
-    head10  = style("head10",  fontName="Helvetica-Bold", fontSize=10)
+    bold_r  = style("bold_r",  fontName=_FONT_BOLD, alignment=TA_RIGHT, fontSize=9)
+    title_s = style("title_s", fontName=_FONT_BOLD, fontSize=15, textColor=SHEKO_BLUE)
+    head10  = style("head10",  fontName=_FONT_BOLD, fontSize=10)
 
     seller = data["seller"]
     buyer  = data["buyer"]
@@ -486,8 +564,8 @@ def build_pdf(data: dict) -> bytes:
 
     meta_tbl = Table(inv_meta, colWidths=[40*mm, 50*mm, 40*mm, 45*mm])
     meta_tbl.setStyle(TableStyle([
-        ("FONTNAME",  (0,0), (0,-1), "Helvetica-Bold"),
-        ("FONTNAME",  (2,0), (2,-1), "Helvetica-Bold"),
+        ("FONTNAME",  (0,0), (0,-1), _FONT_BOLD),
+        ("FONTNAME",  (2,0), (2,-1), _FONT_BOLD),
         ("FONTSIZE",  (0,0), (-1,-1), 8.5),
         ("TOPPADDING",    (0,0), (-1,-1), 1),
         ("BOTTOMPADDING", (0,0), (-1,-1), 1),
@@ -505,7 +583,9 @@ def build_pdf(data: dict) -> bytes:
 
     rows = [col_headers]
     for i, pos in enumerate(data["positions"], 1):
-        net_price = d4(pos["gross_price"]) * (1 - Decimal(str(pos.get("discount_pct", 0))) / 100)
+        gross_d4  = d4(pos["gross_price"])
+        disc_a    = d4(gross_d4 * Decimal(str(pos.get("discount_pct", 0))) / 100) if pos.get("discount_pct", 0) > 0 else Decimal("0")
+        net_price = gross_d4 - disc_a
         line_total = d2(net_price * Decimal(str(pos["qty"])))
         disc_str   = f"{pos.get('discount_pct',0):.1f}%" if pos.get("discount_pct", 0) > 0 else "–"
         gtin_str   = pos.get("gtin", "")
@@ -529,7 +609,7 @@ def build_pdf(data: dict) -> bytes:
     pos_tbl.setStyle(TableStyle([
         ("BACKGROUND",    (0,0), (-1,0), SHEKO_BLUE),
         ("TEXTCOLOR",     (0,0), (-1,0), colors.white),
-        ("FONTNAME",      (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTNAME",      (0,0), (-1,0), _FONT_BOLD),
         ("FONTSIZE",      (0,0), (-1,-1), 7.5),
         ("ALIGN",         (3,0), (-1,-1), "RIGHT"),
         ("ALIGN",         (0,0), (2,-1), "LEFT"),
@@ -620,6 +700,7 @@ with tab1:
     st.subheader("Käufer / Rechnungsempfänger")
     c1, c2, c3 = st.columns(3)
     buyer_name   = c1.text_input("Firmenname Käufer *", value="Markant Handels und Service GmbH")
+    c1.caption("⚠️ Exakter Handelsname wie bei Markant hinterlegt – z.B. 'dm-drogerie markt GmbH + Co.KG' (ohne Leerzeichen vor 'KG').")
     buyer_id     = c2.text_input("Kundennummer",        value="")
     buyer_gln    = c3.text_input("GLN Käufer",          value="", placeholder="13-stellig")
     c1, c2, c3 = st.columns(3)
@@ -691,7 +772,9 @@ with tab2:
                                      index=VAT_RATES.index(pos["vat_rate"]) if pos["vat_rate"] in VAT_RATES else 0,
                                      key=f"v{i}")
 
-            net  = d4(pos["gross_price"]) * (1 - Decimal(str(pos["discount_pct"])) / 100)
+            _gd  = d4(pos["gross_price"])
+            _da  = d4(_gd * Decimal(str(pos["discount_pct"])) / 100) if pos["discount_pct"] > 0 else Decimal("0")
+            net  = _gd - _da
             tot  = d2(net * Decimal(str(pos["qty"])))
             st.caption(f"Nettopreis: {float(net):.4f} € | Positionsbetrag: {float(tot):.2f} € (netto)")
 
@@ -842,6 +925,12 @@ with tab3:
 
                         with open(out_path, "rb") as f:
                             zugferd_bytes = f.read()
+
+                    # Post-process for PDF/A-3 compliance: add sRGB OutputIntent
+                    try:
+                        zugferd_bytes = _add_srgb_output_intent(zugferd_bytes)
+                    except Exception:
+                        pass  # non-critical, continue without
 
                     filename = f"Rechnung_{inv_number.strip().replace('/','_')}.pdf"
                     st.success("✅ ZUGFeRD Extended Rechnung erfolgreich erstellt!")
