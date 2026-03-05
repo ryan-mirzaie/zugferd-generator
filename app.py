@@ -35,6 +35,11 @@ def _register_fonts():
     if os.path.exists(vera) and os.path.exists(vera_bd):
         pdfmetrics.registerFont(TTFont("VeraSans",      vera))
         pdfmetrics.registerFont(TTFont("VeraSans-Bold", vera_bd))
+        pdfmetrics.registerFontFamily(
+            "VeraSans",
+            normal="VeraSans", bold="VeraSans-Bold",
+            italic="VeraSans", boldItalic="VeraSans-Bold",
+        )
         _FONT_REGULAR = "VeraSans"
         _FONT_BOLD    = "VeraSans-Bold"
 
@@ -217,8 +222,8 @@ def build_xml(data: dict) -> bytes:
         if subject_code:
             etree.SubElement(note, ram("SubjectCode")).text = subject_code
 
-    if data.get("entgeltminderung"):
-        add_note(doc, "Es bestehen Rabatt- oder Bonusvereinbarungen.", "AAK", "ST3")
+    if data.get("entgeltminderung_text"):
+        add_note(doc, data["entgeltminderung_text"], "AAK", "ST3")
     if data.get("seller_reg_note"):
         add_note(doc, data["seller_reg_note"], "REG")
     if data.get("payment_note"):
@@ -404,54 +409,47 @@ def build_xml(data: dict) -> bytes:
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", pretty_print=True)
 
 
-# ─── sRGB OutputIntent post-processor (PDF/A-3 DeviceRGB compliance) ─────────
-def _add_srgb_output_intent(pdf_bytes: bytes) -> bytes:
-    """Post-process PDF to add sRGB OutputIntent for PDF/A-3 DeviceRGB compliance."""
-    icc_paths = [
-        "/System/Library/ColorSync/Profiles/sRGB Profile.icc",
-        "/Library/ColorSync/Profiles/sRGB Profile.icc",
-        "/usr/share/color/icc/sRGB.icc",
-        "/usr/share/color/icc/colord/sRGB.icc",
-    ]
-    icc_data = None
-    for p in icc_paths:
-        if os.path.exists(p):
-            with open(p, "rb") as f:
-                icc_data = f.read()
-            break
-    if not icc_data:
-        return pdf_bytes  # No ICC profile found, skip
+# ─── PDF/A-3 DeviceRGB compliance: add CalRGB as /DefaultRGB ─────────────────
+def _add_pdfa_colorspace(pdf_bytes: bytes) -> bytes:
+    """Post-process PDF to add CalRGB as /DefaultRGB on every page.
 
+    This satisfies the PDF/A-3 requirement that DeviceRGB may only be used
+    when a device-independent DefaultRGB colorspace is defined in the page
+    resources (ISO 19005-3 §6.2.4.3). No ICC file required.
+    """
     from pypdf import PdfReader, PdfWriter
     from pypdf.generic import (
-        DictionaryObject, ArrayObject, NameObject,
-        DecodedStreamObject, NumberObject, ByteStringObject
+        ArrayObject, DictionaryObject, NameObject, FloatObject
     )
+
+    # sRGB D65 white point + gamma 2.2 CalRGB approximation
+    cal_rgb = ArrayObject([
+        NameObject("/CalRGB"),
+        DictionaryObject({
+            NameObject("/WhitePoint"): ArrayObject([
+                FloatObject(0.9505), FloatObject(1.0000), FloatObject(1.0890)
+            ]),
+            NameObject("/Gamma"): ArrayObject([
+                FloatObject(2.2), FloatObject(2.2), FloatObject(2.2)
+            ]),
+            NameObject("/Matrix"): ArrayObject([
+                FloatObject(0.4124), FloatObject(0.2126), FloatObject(0.0193),
+                FloatObject(0.3576), FloatObject(0.7152), FloatObject(0.1192),
+                FloatObject(0.1805), FloatObject(0.0722), FloatObject(0.9505),
+            ]),
+        }),
+    ])
 
     reader = PdfReader(io.BytesIO(pdf_bytes))
     writer = PdfWriter(clone_from=reader)
 
-    # Create ICC profile stream
-    icc_obj = DecodedStreamObject()
-    icc_obj._data = icc_data
-    icc_obj[NameObject("/N")] = NumberObject(3)  # RGB = 3 channels
-    icc_obj[NameObject("/Alternate")] = NameObject("/DeviceRGB")
-    icc_ref = writer._add_object(icc_obj)
-
-    # Create OutputIntent dictionary
-    oi = DictionaryObject()
-    oi[NameObject("/Type")] = NameObject("/OutputIntent")
-    oi[NameObject("/S")] = NameObject("/GTS_PDFA1")
-    oi[NameObject("/OutputConditionIdentifier")] = ByteStringObject(b"sRGB IEC61966-2-1")
-    oi[NameObject("/Info")] = ByteStringObject(b"sRGB IEC61966-2-1")
-    oi[NameObject("/DestOutputProfile")] = icc_ref
-    oi_ref = writer._add_object(oi)
-
-    # Add OutputIntents to the catalog
-    root = writer._root_object
-    if NameObject("/OutputIntents") not in root:
-        root[NameObject("/OutputIntents")] = ArrayObject()
-    root[NameObject("/OutputIntents")].append(oi_ref)
+    for page in writer.pages:
+        if "/Resources" not in page:
+            page[NameObject("/Resources")] = DictionaryObject()
+        res = page["/Resources"]
+        if "/ColorSpace" not in res:
+            res[NameObject("/ColorSpace")] = DictionaryObject()
+        res["/ColorSpace"][NameObject("/DefaultRGB")] = cal_rgb
 
     out = io.BytesIO()
     writer.write(out)
@@ -658,8 +656,8 @@ def build_pdf(data: dict) -> bytes:
         footer_parts.append(data["payment_note"])
     if data.get("skonto_pct", 0) > 0:
         footer_parts.append(f"Bei Zahlung innerhalb {data['skonto_days']} Tagen gewähren wir {data['skonto_pct']:.1f}% Skonto.")
-    if data.get("entgeltminderung"):
-        footer_parts.append("Es bestehen Rabatt- oder Bonusvereinbarungen.")
+    if data.get("entgeltminderung_text"):
+        footer_parts.append(data["entgeltminderung_text"])
     if footer_parts:
         story.append(Paragraph(" | ".join(footer_parts), small8))
         story.append(Spacer(1, 4))
@@ -707,6 +705,8 @@ with tab1:
     buyer_street = c1.text_input("Straße",  value="")
     buyer_zip    = c2.text_input("PLZ",     value="")
     buyer_city   = c3.text_input("Ort",     value="")
+    c1, c2, c3 = st.columns(3)
+    buyer_vat    = c1.text_input("USt-IdNr. Käufer", value="", placeholder="DE123456789")
 
     st.subheader("Abweichende Lieferadresse")
     use_shipto = st.checkbox("Abweichende Lieferadresse / Warenempfänger angeben")
@@ -794,7 +794,14 @@ with tab3:
     skonto_pct  = c1.number_input("Skonto (%)", value=0.0, min_value=0.0, max_value=100.0, step=0.5)
     skonto_days = c2.number_input("Skonto-Frist (Tage)", value=14, min_value=1, step=1)
     payment_note = st.text_input("Zahlungsbedingung (Freitext)", value="Zahlbar innerhalb 30 Tagen netto.")
-    entgeltminderung = st.checkbox("Hinweis auf Entgeltminderung (Rabatt-/Bonusvereinbarungen) anfügen")
+
+    _ENTGELT_OPTIONS = [
+        "– kein Hinweis –",
+        "Es bestehen Rabatt- oder Bonusvereinbarungen.",
+        "Entgeltminderungen können sich aus unseren aktuellen Rahmen- und Konditionsvereinbarungen ergeben.",
+    ]
+    entgeltminderung_sel  = st.selectbox("Hinweis auf Entgeltminderung (Auswählen welche Vereinbarung)", _ENTGELT_OPTIONS)
+    entgeltminderung_text = "" if entgeltminderung_sel == _ENTGELT_OPTIONS[0] else entgeltminderung_sel
 
     seller_reg = (
         f"{seller_name}\n{seller_street}\n{seller_zip} {seller_city}\n"
@@ -874,6 +881,7 @@ with tab3:
                         "zip":     buyer_zip.strip(),
                         "city":    buyer_city.strip(),
                         "country": "DE",
+                        "vat_id":  buyer_vat.strip(),
                     },
                     "shipto": {
                         "name":    shipto_name,
@@ -892,7 +900,8 @@ with tab3:
                     "skonto_pct":          skonto_pct,
                     "skonto_days":         int(skonto_days),
                     "payment_note":        payment_note.strip(),
-                    "entgeltminderung":    entgeltminderung,
+                    "entgeltminderung":      bool(entgeltminderung_text),
+                    "entgeltminderung_text": entgeltminderung_text,
                     "seller_reg_note":     seller_reg,
                     "totals":             calculate_totals(
                         st.session_state.positions, header_disc_pct,
@@ -926,9 +935,9 @@ with tab3:
                         with open(out_path, "rb") as f:
                             zugferd_bytes = f.read()
 
-                    # Post-process for PDF/A-3 compliance: add sRGB OutputIntent
+                    # Post-process for PDF/A-3 compliance: add CalRGB /DefaultRGB
                     try:
-                        zugferd_bytes = _add_srgb_output_intent(zugferd_bytes)
+                        zugferd_bytes = _add_pdfa_colorspace(zugferd_bytes)
                     except Exception:
                         pass  # non-critical, continue without
 
