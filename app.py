@@ -21,6 +21,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_RIGHT
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen.canvas import Canvas
 
 # ─── Font registration (embedded TTF for PDF/A-3 compliance) ─────────────────
 _FONT_REGULAR = "Helvetica"
@@ -44,6 +45,19 @@ def _register_fonts():
         _FONT_BOLD    = "VeraSans-Bold"
 
 _register_fonts()
+
+
+class EmbeddedFontCanvas(Canvas):
+    """Canvas with an embedded-font default to avoid Helvetica fallbacks."""
+
+    def __init__(self, *args, **kwargs):
+        if kwargs.get("initialFontName") is None:
+            kwargs["initialFontName"] = _FONT_REGULAR
+        if kwargs.get("initialFontSize") is None:
+            kwargs["initialFontSize"] = 9
+        if kwargs.get("initialLeading") is None:
+            kwargs["initialLeading"] = 10.8
+        super().__init__(*args, **kwargs)
 
 # ─── Page setup ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -507,6 +521,7 @@ def build_pdf(data: dict) -> bytes:
     ]
     hdr_table = Table(header_data, colWidths=[95*mm, 80*mm])
     hdr_table.setStyle(TableStyle([
+        ("FONTNAME",      (0,0), (-1,-1), _FONT_REGULAR),
         ("VALIGN", (0,0), (-1,-1), "TOP"),
         ("TOPPADDING",    (0,0), (-1,-1), 0),
         ("BOTTOMPADDING", (0,0), (-1,-1), 4),
@@ -541,6 +556,7 @@ def build_pdf(data: dict) -> bytes:
         addr_table = Table([[addr_cols[0], ""]], colWidths=[87*mm, 87*mm])
 
     addr_table.setStyle(TableStyle([
+        ("FONTNAME",      (0,0), (-1,-1), _FONT_REGULAR),
         ("VALIGN",        (0,0), (-1,-1), "TOP"),
         ("TOPPADDING",    (0,0), (-1,-1), 2),
         ("BOTTOMPADDING", (0,0), (-1,-1), 8),
@@ -562,6 +578,7 @@ def build_pdf(data: dict) -> bytes:
 
     meta_tbl = Table(inv_meta, colWidths=[40*mm, 50*mm, 40*mm, 45*mm])
     meta_tbl.setStyle(TableStyle([
+        ("FONTNAME",  (0,0), (-1,-1), _FONT_REGULAR),
         ("FONTNAME",  (0,0), (0,-1), _FONT_BOLD),
         ("FONTNAME",  (2,0), (2,-1), _FONT_BOLD),
         ("FONTSIZE",  (0,0), (-1,-1), 8.5),
@@ -605,6 +622,7 @@ def build_pdf(data: dict) -> bytes:
 
     pos_tbl = Table(rows, colWidths=col_w, repeatRows=1)
     pos_tbl.setStyle(TableStyle([
+        ("FONTNAME",      (0,0), (-1,-1), _FONT_REGULAR),
         ("BACKGROUND",    (0,0), (-1,0), SHEKO_BLUE),
         ("TEXTCOLOR",     (0,0), (-1,0), colors.white),
         ("FONTNAME",      (0,0), (-1,0), _FONT_BOLD),
@@ -642,6 +660,7 @@ def build_pdf(data: dict) -> bytes:
         hAlign="RIGHT"
     )
     tot_tbl.setStyle(TableStyle([
+        ("FONTNAME",      (0,0), (-1,-1), _FONT_REGULAR),
         ("TOPPADDING",    (0,0), (-1,-1), 2),
         ("BOTTOMPADDING", (0,0), (-1,-1), 2),
         ("LINEABOVE",     (0,-1),(-1,-1), 1, SHEKO_BLUE),
@@ -669,7 +688,7 @@ def build_pdf(data: dict) -> bytes:
         style("foot", fontSize=7, textColor=colors.HexColor("#888888"))
     ))
 
-    doc.build(story)
+    doc.build(story, canvasmaker=EmbeddedFontCanvas)
     return buf.getvalue()
 
 

@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Smoke test for ZUGFeRD generator – runs without Streamlit."""
 
+import io
+import os
 import sys
-import re
+import tempfile
 from datetime import date
-from decimal import Decimal
 from unittest.mock import MagicMock
+
+import facturx
+from pypdf import PdfReader
 
 # Mock streamlit
 sys.modules["streamlit"] = MagicMock()
@@ -120,11 +124,52 @@ invoice_data = {
 xml_bytes = build_xml(invoice_data)
 pdf_bytes = build_pdf(invoice_data)
 
+with tempfile.TemporaryDirectory() as tmpdir:
+    pdf_path = os.path.join(tmpdir, "invoice.pdf")
+    xml_path = os.path.join(tmpdir, "factur-x.xml")
+    out_path = os.path.join(tmpdir, "zugferd.pdf")
+
+    with open(pdf_path, "wb") as f:
+        f.write(pdf_bytes)
+    with open(xml_path, "wb") as f:
+        f.write(xml_bytes)
+
+    facturx.generate_from_file(
+        pdf_path,
+        xml_path,
+        flavor="factur-x",
+        level="extended",
+        check_xsd=True,
+        output_pdf_file=out_path,
+    )
+
+    with open(out_path, "rb") as f:
+        hybrid_pdf_bytes = f.read()
+
 assert b"<rsm:CrossIndustryInvoice" in xml_bytes, "XML missing root element"
 assert b"RE-2024-SMOKE-001" in xml_bytes, "XML missing invoice number"
 assert pdf_bytes[:4] == b"%PDF", "PDF does not start with %PDF"
+assert hybrid_pdf_bytes[:4] == b"%PDF", "Hybrid PDF does not start with %PDF"
+
+reader = PdfReader(io.BytesIO(hybrid_pdf_bytes))
+unembedded_fonts = []
+for page in reader.pages:
+    resources = page.get("/Resources") or {}
+    fonts = resources.get("/Font") or {}
+    for font_ref in fonts.values():
+        font = font_ref.get_object()
+        descriptor = font.get("/FontDescriptor")
+        if descriptor is None:
+            unembedded_fonts.append(str(font.get("/BaseFont")))
+            continue
+        descriptor = descriptor.get_object()
+        if not any(key in descriptor for key in ("/FontFile", "/FontFile2", "/FontFile3")):
+            unembedded_fonts.append(str(font.get("/BaseFont")))
+
+assert not unembedded_fonts, f"Unembedded fonts found in hybrid PDF: {sorted(set(unembedded_fonts))}"
 
 print(f"XML size:    {len(xml_bytes):,} bytes")
 print(f"PDF size:    {len(pdf_bytes):,} bytes")
+print(f"Hybrid PDF:  {len(hybrid_pdf_bytes):,} bytes")
 print(f"Grand total: {float(totals['grand_total']):.2f} EUR")
 print("✅ Smoke test passed")
