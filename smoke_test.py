@@ -41,6 +41,7 @@ positions = [
         "gross_price": 24.99,
         "discount_pct": 5.0,
         "vat_rate": 19.0,
+        "tax_treatment": "19% Standard",
     },
     {
         "gtin": "4012345678902",
@@ -52,6 +53,7 @@ positions = [
         "gross_price": 2.49,
         "discount_pct": 0.0,
         "vat_rate": 7.0,
+        "tax_treatment": "7% Ermäßigt",
     },
     {
         "gtin": "",
@@ -63,6 +65,7 @@ positions = [
         "gross_price": 0.0,
         "discount_pct": 0.0,
         "vat_rate": 0.0,
+        "tax_treatment": "0% Nullsatz",
     },
 ]
 

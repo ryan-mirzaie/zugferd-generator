@@ -101,6 +101,41 @@ UNIT_OPTIONS = {
 }
 VAT_RATES = [19.0, 7.0, 0.0]
 
+# ─── Tax treatments: CategoryCode + optional VATEX exemption ─────────────────
+TAX_TREATMENTS = {
+    "19% Standard":              {"rate": 19.0, "cat": "S"},
+    "7% Ermäßigt":               {"rate": 7.0,  "cat": "S"},
+    "0% Nullsatz":               {"rate": 0.0,  "cat": "Z"},
+    "0% Reverse Charge §13b":    {"rate": 0.0,  "cat": "AE",
+                                  "reason": "Steuerschuldnerschaft des Leistungsempfängers",
+                                  "reason_code": "VATEX-EU-AE"},
+    "0% Innergem. Lieferung":    {"rate": 0.0,  "cat": "K",
+                                  "reason": "Innergemeinschaftliche Lieferung gem. Art. 138 MwStSystRL",
+                                  "reason_code": "VATEX-EU-IC"},
+    "0% Steuerbefreit":          {"rate": 0.0,  "cat": "E",
+                                  "reason": "Steuerbefreit gemäß §4 UStG",
+                                  "reason_code": "VATEX-EU-132"},
+    "0% Export / Ausfuhr":       {"rate": 0.0,  "cat": "G",
+                                  "reason": "Ausfuhrlieferung",
+                                  "reason_code": "VATEX-EU-G"},
+    "0% Nicht steuerbar":        {"rate": 0.0,  "cat": "O",
+                                  "reason": "Nicht im Geltungsbereich der MwSt",
+                                  "reason_code": "VATEX-EU-O"},
+}
+TAX_TREATMENT_LABELS = list(TAX_TREATMENTS.keys())
+
+def _tax_cat_for_pos(pos: dict) -> str:
+    """Return the CategoryCode for a position dict (backward-compatible)."""
+    if "tax_treatment" in pos and pos["tax_treatment"] in TAX_TREATMENTS:
+        return TAX_TREATMENTS[pos["tax_treatment"]]["cat"]
+    return "S" if pos["vat_rate"] > 0 else "Z"
+
+def _tax_info_for_pos(pos: dict) -> dict:
+    """Return the full tax treatment dict for a position."""
+    if "tax_treatment" in pos and pos["tax_treatment"] in TAX_TREATMENTS:
+        return TAX_TREATMENTS[pos["tax_treatment"]]
+    return {"rate": pos["vat_rate"], "cat": "S" if pos["vat_rate"] > 0 else "Z"}
+
 CII_NS   = "urn:un:unece:uncefact:data:standard:CrossIndustryInvoice:100"
 RAM_NS   = "urn:un:unece:uncefact:data:standard:ReusableAggregateBusinessInformationEntity:100"
 UDT_NS   = "urn:un:unece:uncefact:data:standard:UnqualifiedDataType:100"
@@ -129,54 +164,73 @@ def d4(x) -> Decimal:
     return Decimal(str(x)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
 
 # ─── Calculation engine ───────────────────────────────────────────────────────
-def calculate_totals(positions, header_discount_pct, shipping_charge_eur, shipping_vat_rate=19.0):
-    """Calculate invoice totals grouped by VAT rate."""
-    vat_groups: dict[Decimal, Decimal] = {}
+def calculate_totals(positions, header_discount_pct, shipping_charge_eur,
+                     shipping_vat_rate=19.0, shipping_tax_treatment=None):
+    """Calculate invoice totals grouped by VAT rate + tax category."""
+    # Group by (rate, category_code) so e.g. 0%/Z and 0%/AE stay separate
+    vat_groups: dict[tuple, Decimal] = {}
+    group_info: dict[tuple, dict]    = {}   # store full tax info per group key
 
     for pos in positions:
-        rate      = Decimal(str(pos["vat_rate"]))
-        gross_d4  = d4(pos["gross_price"])
-        disc_amt  = d4(gross_d4 * Decimal(str(pos["discount_pct"])) / 100) if pos["discount_pct"] > 0 else Decimal("0")
+        rate     = Decimal(str(pos["vat_rate"]))
+        tinfo    = _tax_info_for_pos(pos)
+        cat      = tinfo["cat"]
+        key      = (rate, cat)
+        gross_d4 = d4(pos["gross_price"])
+        disc_amt = d4(gross_d4 * Decimal(str(pos["discount_pct"])) / 100) if pos["discount_pct"] > 0 else Decimal("0")
         net_price = gross_d4 - disc_amt
         line_tot  = d2(net_price * Decimal(str(pos["qty"])))
-        vat_groups[rate] = vat_groups.get(rate, Decimal("0")) + line_tot
+        vat_groups[key] = vat_groups.get(key, Decimal("0")) + line_tot
+        group_info[key] = tinfo
 
     total_lines = sum(vat_groups.values())
     disc_pct    = Decimal(str(header_discount_pct)) / 100
 
     tax_details = []
-    for rate, line_total in sorted(vat_groups.items(), reverse=True):
+    for (rate, cat), line_total in sorted(vat_groups.items(), key=lambda x: x[0][0], reverse=True):
         allowance   = d2(line_total * disc_pct) if total_lines > 0 else Decimal("0")
         basis       = line_total - allowance
         vat_amount  = d2(basis * rate / 100)
+        tinfo       = group_info[(rate, cat)]
         tax_details.append({
-            "rate":       rate,
-            "line_total": line_total,
-            "allowance":  allowance,
-            "charge":     Decimal("0"),
-            "basis":      basis,
-            "vat_amount": vat_amount,
+            "rate":        rate,
+            "cat":         cat,
+            "reason":      tinfo.get("reason", ""),
+            "reason_code": tinfo.get("reason_code", ""),
+            "line_total":  line_total,
+            "allowance":   allowance,
+            "charge":      Decimal("0"),
+            "basis":       basis,
+            "vat_amount":  vat_amount,
         })
 
     # Add shipping charge
     if shipping_charge_eur > 0:
         ship_rate   = Decimal(str(shipping_vat_rate))
+        if shipping_tax_treatment and shipping_tax_treatment in TAX_TREATMENTS:
+            ship_tinfo = TAX_TREATMENTS[shipping_tax_treatment]
+        else:
+            ship_tinfo = {"rate": float(ship_rate), "cat": "S" if ship_rate > 0 else "Z"}
+        ship_cat    = ship_tinfo["cat"]
         ship_amount = d2(shipping_charge_eur)
         ship_vat    = d2(ship_amount * ship_rate / 100)
         for td in tax_details:
-            if td["rate"] == ship_rate:
+            if td["rate"] == ship_rate and td["cat"] == ship_cat:
                 td["charge"] += ship_amount
                 td["basis"]  += ship_amount
                 td["vat_amount"] = d2(td["basis"] * td["rate"] / 100)
                 break
         else:
             tax_details.append({
-                "rate":       ship_rate,
-                "line_total": Decimal("0"),
-                "allowance":  Decimal("0"),
-                "charge":     ship_amount,
-                "basis":      ship_amount,
-                "vat_amount": ship_vat,
+                "rate":        ship_rate,
+                "cat":         ship_cat,
+                "reason":      ship_tinfo.get("reason", ""),
+                "reason_code": ship_tinfo.get("reason_code", ""),
+                "line_total":  Decimal("0"),
+                "allowance":   Decimal("0"),
+                "charge":      ship_amount,
+                "basis":       ship_amount,
+                "vat_amount":  ship_vat,
             })
 
     total_allowances  = sum(td["allowance"] for td in tax_details)
@@ -283,7 +337,7 @@ def build_xml(data: dict) -> bytes:
         settl = etree.SubElement(line, ram("SpecifiedLineTradeSettlement"))
         tax   = etree.SubElement(settl, ram("ApplicableTradeTax"))
         etree.SubElement(tax, ram("TypeCode")).text              = "VAT"
-        etree.SubElement(tax, ram("CategoryCode")).text          = "S" if pos["vat_rate"] > 0 else "Z"
+        etree.SubElement(tax, ram("CategoryCode")).text          = _tax_cat_for_pos(pos)
         etree.SubElement(tax, ram("RateApplicablePercent")).text = str(pos["vat_rate"])
 
         line_total = d2(net_price * Decimal(str(pos["qty"])))
@@ -370,10 +424,14 @@ def build_xml(data: dict) -> bytes:
         appt = etree.SubElement(hts, ram("ApplicableTradeTax"))
         etree.SubElement(appt, ram("CalculatedAmount")).text       = fmt_money(td["vat_amount"])
         etree.SubElement(appt, ram("TypeCode")).text               = "VAT"
+        if td.get("reason"):
+            etree.SubElement(appt, ram("ExemptionReason")).text    = td["reason"]
         etree.SubElement(appt, ram("BasisAmount")).text            = fmt_money(td["basis"])
         etree.SubElement(appt, ram("LineTotalBasisAmount")).text   = fmt_money(td["line_total"])
         etree.SubElement(appt, ram("AllowanceChargeBasisAmount")).text = fmt_money(-td["allowance"])
-        etree.SubElement(appt, ram("CategoryCode")).text           = "S" if td["rate"] > 0 else "Z"
+        etree.SubElement(appt, ram("CategoryCode")).text           = td.get("cat", "S" if td["rate"] > 0 else "Z")
+        if td.get("reason_code"):
+            etree.SubElement(appt, ram("ExemptionReasonCode")).text = td["reason_code"]
         etree.SubElement(appt, ram("RateApplicablePercent")).text  = str(td["rate"])
 
     for td in totals["tax_details"]:
@@ -388,17 +446,22 @@ def build_xml(data: dict) -> bytes:
             etree.SubElement(alloc, ram("Reason")).text       = data.get("header_discount_name", "Rechnungsrabatt")
             ctax = etree.SubElement(alloc, ram("CategoryTradeTax"))
             etree.SubElement(ctax, ram("TypeCode")).text             = "VAT"
-            etree.SubElement(ctax, ram("CategoryCode")).text         = "S" if td["rate"] > 0 else "Z"
+            etree.SubElement(ctax, ram("CategoryCode")).text         = td.get("cat", "S" if td["rate"] > 0 else "Z")
             etree.SubElement(ctax, ram("RateApplicablePercent")).text = str(td["rate"])
 
     if data.get("shipping_charge_eur", 0) > 0:
         ship_rate = Decimal(str(data.get("shipping_vat_rate", 19.0)))
+        ship_tt   = data.get("shipping_tax_treatment", "")
+        if ship_tt and ship_tt in TAX_TREATMENTS:
+            ship_cat = TAX_TREATMENTS[ship_tt]["cat"]
+        else:
+            ship_cat = "S" if ship_rate > 0 else "Z"
         slsc = etree.SubElement(hts, ram("SpecifiedLogisticsServiceCharge"))
         etree.SubElement(slsc, ram("Description")).text  = "Transportkosten"
         etree.SubElement(slsc, ram("AppliedAmount")).text = fmt_money(d2(data["shipping_charge_eur"]))
         atax = etree.SubElement(slsc, ram("AppliedTradeTax"))
         etree.SubElement(atax, ram("TypeCode")).text              = "VAT"
-        etree.SubElement(atax, ram("CategoryCode")).text          = "S" if ship_rate > 0 else "Z"
+        etree.SubElement(atax, ram("CategoryCode")).text          = ship_cat
         etree.SubElement(atax, ram("RateApplicablePercent")).text = str(ship_rate)
 
     if data.get("payment_note") or data.get("skonto_pct", 0) > 0:
@@ -616,7 +679,7 @@ def build_pdf(data: dict) -> bytes:
             f"{float(pos['gross_price']):.2f}",
             disc_str,
             f"{float(net_price):.4f}",
-            f"{pos['vat_rate']:.0f}%",
+            f"{pos['vat_rate']:.0f}%" + (f" {_tax_cat_for_pos(pos)}" if _tax_cat_for_pos(pos) != "S" else ""),
             f"{float(line_total):.2f}",
         ])
 
@@ -647,9 +710,13 @@ def build_pdf(data: dict) -> bytes:
                          f"– {float(totals['allowance_total_amount']):.2f} €"])
     tot_rows.append(["Nettobetrag:", f"{float(totals['tax_basis_total']):.2f} €"])
     for td in totals["tax_details"]:
+        cat = td.get("cat", "S")
         if td["vat_amount"] > 0:
             tot_rows.append([f"MwSt. {td['rate']:.0f}% auf {float(td['basis']):.2f} €:",
                              f"{float(td['vat_amount']):.2f} €"])
+        elif cat not in ("S",) and td["basis"] > 0:
+            tot_rows.append([f"MwSt. {td['rate']:.0f}% ({cat}) auf {float(td['basis']):.2f} €:",
+                             f"0.00 €"])
     tot_rows.append(["RECHNUNGSBETRAG:", f"{float(totals['grand_total']):.2f} €"])
 
     tot_tbl = Table(
@@ -709,7 +776,8 @@ with st.sidebar:
     seller_phone  = st.text_input("Telefon",           value="")
     st.divider()
     test_mode = st.checkbox("Testmodus (TestIndicator=true)", value=True)
-    shipping_vat_rate = st.selectbox("MwSt. auf Transportkosten", [19.0, 7.0, 0.0], index=0)
+    shipping_tax_treatment = st.selectbox("Steuer auf Transportkosten", TAX_TREATMENT_LABELS, index=0)
+    shipping_vat_rate = TAX_TREATMENTS[shipping_tax_treatment]["rate"]
 
 tab1, tab2, tab3 = st.tabs(["📄 Belegkopf & Käufer", "🛒 Positionen", "💰 Konditionen & Download"])
 
@@ -767,7 +835,8 @@ with tab2:
     def add_pos():
         st.session_state.positions.append(
             {"gtin":"","seller_id":"","buyer_id":"","name":"",
-             "qty":1.0,"unit":"H87","gross_price":0.0,"discount_pct":0.0,"vat_rate":19.0}
+             "qty":1.0,"unit":"H87","gross_price":0.0,"discount_pct":0.0,
+             "vat_rate":19.0,"tax_treatment":"19% Standard"}
         )
 
     to_remove = []
@@ -791,9 +860,14 @@ with tab2:
                                      min_value=0.0, step=0.01, format="%.4f", key=f"p{i}")
             pos["discount_pct"]= c4.number_input("Rabatt %", value=float(pos["discount_pct"]),
                                      min_value=0.0, max_value=100.0, step=0.5, key=f"r{i}")
-            pos["vat_rate"]    = c5.selectbox("MwSt. %", VAT_RATES,
-                                     index=VAT_RATES.index(pos["vat_rate"]) if pos["vat_rate"] in VAT_RATES else 0,
+            _cur_tt = pos.get("tax_treatment", "19% Standard")
+            if _cur_tt not in TAX_TREATMENT_LABELS:
+                _cur_tt = "19% Standard"
+            _tt_label = c5.selectbox("Steuerkennz.", TAX_TREATMENT_LABELS,
+                                     index=TAX_TREATMENT_LABELS.index(_cur_tt),
                                      key=f"v{i}")
+            pos["tax_treatment"] = _tt_label
+            pos["vat_rate"]      = TAX_TREATMENTS[_tt_label]["rate"]
 
             _gd  = d4(pos["gross_price"])
             _da  = d4(_gd * Decimal(str(pos["discount_pct"])) / 100) if pos["discount_pct"] > 0 else Decimal("0")
@@ -834,7 +908,7 @@ with tab3:
     if st.session_state.positions:
         totals = calculate_totals(
             st.session_state.positions, header_disc_pct,
-            shipping_charge, shipping_vat_rate
+            shipping_charge, shipping_vat_rate, shipping_tax_treatment
         )
         st.divider()
         st.subheader("Vorschau Beträge")
@@ -845,8 +919,9 @@ with tab3:
         c4.metric("Positionen",            len(st.session_state.positions))
 
         for td in totals["tax_details"]:
+            cat_label = f" ({td['cat']})" if td.get("cat") and td["cat"] != "S" else ""
             st.caption(
-                f"MwSt. {td['rate']:.0f}%: Basis {float(td['basis']):.2f} € → "
+                f"MwSt. {td['rate']:.0f}%{cat_label}: Basis {float(td['basis']):.2f} € → "
                 f"Steuer {float(td['vat_amount']):.2f} €"
             )
 
@@ -919,7 +994,8 @@ with tab3:
                     "header_discount_pct": header_disc_pct,
                     "header_discount_name":header_disc_name,
                     "shipping_charge_eur": shipping_charge,
-                    "shipping_vat_rate":   shipping_vat_rate,
+                    "shipping_vat_rate":         shipping_vat_rate,
+                    "shipping_tax_treatment":    shipping_tax_treatment,
                     "skonto_pct":          skonto_pct,
                     "skonto_days":         int(skonto_days),
                     "payment_note":        payment_note.strip(),
@@ -928,7 +1004,7 @@ with tab3:
                     "seller_reg_note":     seller_reg,
                     "totals":             calculate_totals(
                         st.session_state.positions, header_disc_pct,
-                        shipping_charge, shipping_vat_rate
+                        shipping_charge, shipping_vat_rate, shipping_tax_treatment
                     ),
                 }
 
