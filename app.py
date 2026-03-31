@@ -82,14 +82,14 @@ if "positions" not in st.session_state:
     st.session_state.positions = [
         {
             "gtin": "", "seller_id": "", "buyer_id": "", "name": "",
-            "qty": 1.0, "unit": "H87",
+            "qty": 1.0, "unit": "C62",
             "gross_price": 0.0, "discount_pct": 0.0, "vat_rate": 19.0,
         }
     ]
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 UNIT_OPTIONS = {
-    "H87 – Stück":    "H87",
+    "C62 – Stück":    "C62",
     "KGM – Kilogramm": "KGM",
     "GRM – Gramm":    "GRM",
     "LTR – Liter":    "LTR",
@@ -109,7 +109,7 @@ TAX_TREATMENTS = {
     "0% Reverse Charge §13b":    {"rate": 0.0,  "cat": "AE",
                                   "reason": "Steuerschuldnerschaft des Leistungsempfängers",
                                   "reason_code": "VATEX-EU-AE"},
-    "0% Innergem. Lieferung":    {"rate": 0.0,  "cat": "K",
+    "0% Innergem. Lieferung":    {"rate": 0.0,  "cat": "AE",
                                   "reason": "Innergemeinschaftliche Lieferung gem. Art. 138 MwStSystRL",
                                   "reason_code": "VATEX-EU-IC"},
     "0% Steuerbefreit":          {"rate": 0.0,  "cat": "E",
@@ -263,6 +263,7 @@ def build_xml(data: dict) -> bytes:
     def rsm(tag):  return f"{{{CII_NS}}}{tag}"
     def ram(tag):  return f"{{{RAM_NS}}}{tag}"
     def udt(tag):  return f"{{{UDT_NS}}}{tag}"
+    def qdt(tag):  return f"{{{QDT_NS}}}{tag}"
 
     root = etree.Element(rsm("CrossIndustryInvoice"), nsmap=nsmap)
 
@@ -277,7 +278,6 @@ def build_xml(data: dict) -> bytes:
     # ── ExchangedDocument ─────────────────────────────────────────────────────
     doc = etree.SubElement(root, rsm("ExchangedDocument"))
     etree.SubElement(doc, ram("ID")).text       = data["inv_number"]
-    etree.SubElement(doc, ram("Name")).text     = data["doc_type"]
     etree.SubElement(doc, ram("TypeCode")).text = "380"
     idt = etree.SubElement(doc, ram("IssueDateTime"))
     etree.SubElement(idt, udt("DateTimeString"), format="102").text = fmt_date(data["inv_date"])
@@ -381,9 +381,15 @@ def build_xml(data: dict) -> bytes:
     if data.get("seller_order_ref"):
         sord = etree.SubElement(hta, ram("SellerOrderReferencedDocument"))
         etree.SubElement(sord, ram("IssuerAssignedID")).text = data["seller_order_ref"]
+        if data.get("seller_order_date"):
+            fidt = etree.SubElement(sord, ram("FormattedIssueDateTime"))
+            etree.SubElement(fidt, qdt("DateTimeString"), format="102").text = fmt_date(data["seller_order_date"])
     if data.get("order_ref"):
         bord = etree.SubElement(hta, ram("BuyerOrderReferencedDocument"))
         etree.SubElement(bord, ram("IssuerAssignedID")).text = data["order_ref"]
+        if data.get("order_date"):
+            fidt = etree.SubElement(bord, ram("FormattedIssueDateTime"))
+            etree.SubElement(fidt, qdt("DateTimeString"), format="102").text = fmt_date(data["order_date"])
 
     # ── Header trade delivery ─────────────────────────────────────────────────
     htd = etree.SubElement(sctt, ram("ApplicableHeaderTradeDelivery"))
@@ -413,6 +419,9 @@ def build_xml(data: dict) -> bytes:
     if data.get("delivery_ref"):
         dnrd = etree.SubElement(htd, ram("DeliveryNoteReferencedDocument"))
         etree.SubElement(dnrd, ram("IssuerAssignedID")).text = data["delivery_ref"]
+        if data.get("delivery_ref_date"):
+            fidt = etree.SubElement(dnrd, ram("FormattedIssueDateTime"))
+            etree.SubElement(fidt, qdt("DateTimeString"), format="102").text = fmt_date(data["delivery_ref_date"])
 
     # ── Header trade settlement ───────────────────────────────────────────────
     hts = etree.SubElement(sctt, ram("ApplicableHeaderTradeSettlement"))
@@ -826,6 +835,11 @@ with tab1:
     delivery_ref = c2.text_input("Lieferscheinnummer",     value="")
     seller_order = c3.text_input("Auftragsnummer (Verkäufer)", value="")
 
+    c1, c2, c3 = st.columns(3)
+    order_date       = c1.date_input("Bestelldatum", value=None, key="order_date")
+    delivery_ref_date = c2.date_input("Lieferscheindatum", value=None, key="delivery_ref_date")
+    seller_order_date = c3.date_input("Auftragsdatum (Verkäufer)", value=None, key="seller_order_date")
+
     doc_type = st.selectbox("Belegqualifizierung",
         ["WARENRECHNUNG", "SAMMELRECHNUNG", "SERVICERECHNUNG", "KOSTENRECHNUNG", "REPARATURRECHNUNG"])
 
@@ -938,6 +952,10 @@ with tab3:
             errors.append("Name Verkäufer fehlt.")
         if not st.session_state.positions:
             errors.append("Mindestens eine Position erforderlich.")
+        for plz_label, plz_val in [("Verkäufer-PLZ", seller_zip), ("Käufer-PLZ", buyer_zip), ("Liefer-PLZ", shipto_zip)]:
+            v = plz_val.strip()
+            if v and (len(v) > 10 or (any(c.isalpha() for c in v) and len(v) > 6)):
+                errors.append(f"{plz_label} \"{v}\" sieht nicht wie eine Postleitzahl aus – ggf. PLZ und Ort vertauscht?")
         for i, pos in enumerate(st.session_state.positions, 1):
             if not pos["name"].strip():
                 errors.append(f"Position {i}: Artikelbezeichnung fehlt.")
@@ -956,8 +974,11 @@ with tab3:
                     "currency":        currency,
                     "doc_type":        doc_type,
                     "order_ref":       order_ref.strip(),
+                    "order_date":      order_date,
                     "delivery_ref":    delivery_ref.strip(),
+                    "delivery_ref_date": delivery_ref_date,
                     "seller_order_ref":seller_order.strip(),
+                    "seller_order_date": seller_order_date,
                     "test_mode":       test_mode,
                     "seller": {
                         "name":    seller_name,

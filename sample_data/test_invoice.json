@@ -45,7 +45,7 @@
       "buyer_id": "",
       "name": "SHEKO Protein Shake Schokolade 500g",
       "qty": 10.0,
-      "unit": "H87",
+      "unit": "C62",
       "gross_price": 24.99,
       "discount_pct": 5.0,
       "vat_rate": 19.0
@@ -56,7 +56,7 @@
       "buyer_id": "",
       "name": "SHEKO Vitamin Drink Beere 330ml",
       "qty": 50.0,
-      "unit": "H87",
+      "unit": "C62",
       "gross_price": 2.49,
       "discount_pct": 0.0,
       "vat_rate": 7.0
@@ -67,7 +67,7 @@
       "buyer_id": "",
       "name": "Displaymaterial / Werbemittel",
       "qty": 1.0,
-      "unit": "H87",
+      "unit": "C62",
       "gross_price": 0.0,
       "discount_pct": 0.0,
       "vat_rate": 0.0
